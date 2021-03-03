@@ -1,0 +1,154 @@
+import torch.nn as nn
+import torch.nn.functional as F
+import torch
+from anchor import make_center_anchors
+from utils import find_jaccard_overlap, center_to_corner, corner_to_center
+from config import device
+
+
+class Yolo_Loss(nn.Module):
+    def __init__(self, num_classes=20):
+        super().__init__()
+        self.num_classes = num_classes
+        self.anchor_whs = [(1.3221, 1.73145), (3.19275, 4.00944), (5.05587, 8.09892), (9.47112, 4.84053), (11.2364, 10.0071)]
+        self.center_anchors = make_center_anchors(anchor_whs=self.anchor_whs, grid_size=13)
+        self.corner_anchors = center_to_corner(self.center_anchors).view(13 * 13 * 5, 4)
+
+    def make_target(self, gt_boxes, gt_labels, pred_xy, pred_wh):
+        """
+        gt 와 pred 가 들어왔을 때 loss 를 구할 수 있도록 변환해주는 함수
+        :param gt_boxes:    (B, 4)
+        :param gt_labels:   (B)
+        :param pred_xy:     (B, 13, 13, 5, 2)
+        :param pred_wh:     (B, 13, 13, 5, 2)
+
+        :return: resp_mask :(B, 13, 13, 5) 그곳에 object 가 있는지 여부
+                 gt_xy     :(B, 13, 13, 5, 2)
+                 gt_wh     :(B, 13, 13, 5, 2)
+                 gt_conf   :(B, 13, 13, 5)
+                 gt_cls    :(B, 13, 13, 5, num_classes)
+        """
+        out_size = pred_xy.size(2)
+        batch_size = pred_xy.size(0)
+        resp_mask = torch.zeros([batch_size, out_size, out_size, 5])  # y, x, anchor, ~
+        gt_xy = torch.zeros([batch_size, out_size, out_size, 5, 2])
+        gt_wh = torch.zeros([batch_size, out_size, out_size, 5, 2])
+        gt_conf = torch.zeros([batch_size, out_size, out_size, 5])
+        gt_cls = torch.zeros([batch_size, out_size, out_size, 5, self.num_classes])
+
+        # 1. make resp_mask
+        for b in range(batch_size):
+
+            label = gt_labels[b]
+            corner_gt_box = gt_boxes[b]
+            corner_gt_box_13 = corner_gt_box * float(out_size)
+
+            center_gt_box = corner_to_center(corner_gt_box)
+            center_gt_box_13 = center_gt_box * float(out_size)
+
+            bxby = center_gt_box_13[..., :2]  # [# obj, 2]
+            x_y_ = bxby - bxby.floor()        # [# obj, 2], 0~1 scale
+            bwbh = center_gt_box_13[..., 2:]
+
+            iou_anchors_gt = find_jaccard_overlap(self.corner_anchors, corner_gt_box_13)  # [845, # obj]
+            iou_anchors_gt = iou_anchors_gt.view(out_size, out_size, 5, -1)
+
+            num_obj = corner_gt_box.size(0)
+
+            for n_obj in range(num_obj):
+                cx, cy = bxby[n_obj]
+                cx = int(cx)
+                cy = int(cy)
+
+                _, max_idx = iou_anchors_gt[cy, cx, :, n_obj].max(0)  # which anchor has maximum iou?
+                j = max_idx  # j is idx.
+                # # j-th anchor
+                resp_mask[b, cy, cx, j] = 1
+                gt_xy[b, cy, cx, j, :] = x_y_[n_obj]
+                w_h_ = bwbh[n_obj] / torch.FloatTensor(self.anchor_whs[j]).to(device)   # ratio
+                gt_wh[b, cy, cx, j, :] = w_h_
+                gt_cls[b, cy, cx, j, int(label[n_obj].item())] = 1
+
+            pred_xy_ = pred_xy[b]
+            pred_wh_ = pred_wh[b]
+            center_pred_xy = self.center_anchors[..., :2].floor() + pred_xy_             # [845, 2] fix floor error
+            center_pred_wh = self.center_anchors[..., 2:] * pred_wh_                     # [845, 2]
+            center_pred_bbox = torch.cat([center_pred_xy, center_pred_wh], dim=-1)
+            corner_pred_bbox = center_to_corner(center_pred_bbox).view(-1, 4)       # [845, 4]
+
+            iou_pred_gt = find_jaccard_overlap(corner_pred_bbox, corner_gt_box_13)  # [845, # obj]
+            iou_pred_gt = iou_pred_gt.view(out_size, out_size, 5, -1)
+
+            gt_conf[b] = iou_pred_gt.max(-1)[0]  # each obj, maximum preds          # [13, 13, 5]
+
+        return resp_mask, gt_xy, gt_wh, gt_conf, gt_cls
+
+    def forward(self, pred_targets, gt_boxes, gt_labels):
+        """
+
+        :param pred_targets: (B, 13, 13, 125)
+        :param gt_boxes:     (B, 4)
+        :param gt_labels:
+        :return:
+        """
+        out_size = pred_targets.size(1)
+        pred_targets = pred_targets.view(-1, out_size, out_size, 5, 5 + self.num_classes)
+        pred_xy = pred_targets[..., :2].sigmoid()                  # sigmoid(tx ty)  0, 1
+        pred_wh = pred_targets[..., 2:4].exp()                     # 2, 3
+        pred_conf = pred_targets[..., 4].sigmoid()                 # 4
+        pred_cls = pred_targets[..., 5:]                           # 20
+
+        resp_mask, gt_xy, gt_wh, gt_conf, gt_cls = self.make_target(gt_boxes, gt_labels, pred_xy, pred_wh)
+
+        # 1. xy sse
+        # sse
+        xy_loss = resp_mask.unsqueeze(-1).expand_as(gt_xy) * (gt_xy - pred_xy.cpu()) ** 2
+
+        # 2. wh loss
+        wh_loss = resp_mask.unsqueeze(-1).expand_as(gt_wh) * (torch.sqrt(gt_wh) - torch.sqrt(pred_wh.cpu())) ** 2
+
+        # 3. conf loss
+        conf_loss = resp_mask * (gt_conf - pred_conf.cpu()) ** 2
+
+        # 4. no conf loss
+        no_conf_loss = (1 - resp_mask).squeeze(-1) * (gt_conf - pred_conf.cpu()) ** 2
+
+        # 5. classification loss
+        pred_cls = F.softmax(pred_cls, dim=-1)  # [N*13*13*5,20]
+        resp_cell = resp_mask.max(-1)[0].unsqueeze(-1).unsqueeze(-1).expand_as(gt_cls)  # [B, 13, 13, 5, 20]
+        # cls_loss = resp_cell * (gt_cls - pred_cls.cpu()) ** 2       # original code
+        cls_loss = resp_cell * (gt_cls * -1 * torch.log(pred_cls.cpu()))
+
+        # ------------------------------- focal loss -----------------------------------
+        # 6. focal loss
+        p_t = pred_cls.cpu()
+        gamma = 2
+        alpha = 0.25
+
+        # balanced cross entropy
+        gt_alpha_right_class = torch.full_like(gt_cls, fill_value=alpha)
+        gt_alpha_wrong_class = 1 - gt_alpha_right_class
+        gt_alpha = torch.where(gt_cls == 1, gt_alpha_right_class, gt_alpha_wrong_class)
+
+        focal_cls_loss = resp_mask.unsqueeze(-1).expand_as(gt_cls) * \
+                         (gt_alpha * torch.pow(1-p_t, gamma) * gt_cls * -1 * torch.log(p_t))
+        # compare to official loss
+
+        loss1 = 5 * xy_loss.sum()
+        loss2 = 5 * wh_loss.sum()
+        loss3 = 1 * conf_loss.sum()
+        loss4 = 0.5 * no_conf_loss.sum()
+        loss5 = 1 * cls_loss.sum()
+
+        return loss1 + loss2 + loss3 + loss4 + loss5, (loss1, loss2, loss3, loss4, loss5)
+
+
+if __name__ == '__main__':
+    image = torch.randn([5, 3, 416, 416])
+    pred = torch.zeros([5, 13, 13, 125])  # batch, 13, 13, etc...
+    criterion = Yolo_Loss(num_classes=20)
+
+
+
+
+
